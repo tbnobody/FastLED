@@ -79,6 +79,8 @@ typedef union {
     uint32_t val;
 } rmtPulsePair;
 
+static uint8_t rmt_channels_used = 0;
+
 template <int DATA_PIN, int T1, int T2, int T3, EOrder RGB_ORDER = RGB, int XTRA0 = 0, bool FLIP = false, int WAIT_TIME = 5>
 class ClocklessController : public CPixelLEDController<RGB_ORDER> {
 
@@ -92,6 +94,7 @@ public:
 	xSemaphoreHandle ws2812_sem = NULL;
 	rmtPulsePair ws2812_bitval_to_rmt_map[2];
 	uint16_t TRS;
+	uint8_t rmt_channel;
 
     virtual void init() {
 		ESP_LOGI("fastled", "T1: %d T2: %d T3: %d", T1, T2, T3);
@@ -108,15 +111,23 @@ public:
 		DPORT_SET_PERI_REG_MASK(DPORT_PERIP_CLK_EN_REG, DPORT_RMT_CLK_EN);
 		DPORT_CLEAR_PERI_REG_MASK(DPORT_PERIP_RST_EN_REG, DPORT_RMT_RST);
 
-		rmt_set_pin(static_cast<rmt_channel_t>(RMTCHANNEL),
+		rmt_channel = rmt_channels_used++;
+		if (rmt_channel > 7) {
+			assert("Only 8 RMT Channels are allowed");
+		}
+
+		ESP_LOGI("fastled", "RMT Channel Init: %d", rmt_channel);
+
+		rmt_set_pin(static_cast<rmt_channel_t>(rmt_channel),
 			RMT_MODE_TX,
 			static_cast<gpio_num_t>(DATA_PIN));
 
-		initRMTChannel(RMTCHANNEL);
+		initRMTChannel(rmt_channel);
 
-		RMT.tx_lim_ch[RMTCHANNEL].limit = MAX_PULSES;
-		RMT.int_ena.ch0_tx_thr_event = 1;
-		RMT.int_ena.ch0_tx_end = 1;
+		RMT.tx_lim_ch[rmt_channel].limit = MAX_PULSES;
+
+		RMT.int_ena.val |= BIT(24 + rmt_channel); // set ch*_tx_thr_event
+		RMT.int_ena.val |= BIT(rmt_channel * 3); // set ch*_tx_end
 
 		// RMT config for WS2812 bit val 0
 		ws2812_bitval_to_rmt_map[0].level0 = 1;
@@ -129,8 +140,6 @@ public:
 		ws2812_bitval_to_rmt_map[1].level1 = 0;
 		ws2812_bitval_to_rmt_map[1].duration0 = T1H / (RMT_DURATION_NS * DIVIDER);
 		ws2812_bitval_to_rmt_map[1].duration1 = T1L / (RMT_DURATION_NS * DIVIDER);
-
-		esp_intr_alloc(ETS_RMT_INTR_SOURCE, 0, ws2812_handleInterrupt, this, &rmt_intr_handle);
     }
 
     virtual uint16_t getMaxRefreshRate() const { return 400; }
@@ -138,6 +147,9 @@ public:
 protected:
 
     virtual void showPixels(PixelController<RGB_ORDER> & pixels) {
+
+		esp_intr_alloc(ETS_RMT_INTR_SOURCE, 0, ws2812_handleInterrupt, this, &rmt_intr_handle);
+
 		ws2812_len = (pixels.size() * 3) * sizeof(uint8_t);
 		ws2812_buffer = (uint8_t *) malloc(ws2812_len);
 
@@ -162,14 +174,15 @@ protected:
 
 		ws2812_sem = xSemaphoreCreateBinary();
 
-		RMT.conf_ch[RMTCHANNEL].conf1.mem_rd_rst = 1;
-		RMT.conf_ch[RMTCHANNEL].conf1.tx_start = 1;
+		RMT.conf_ch[rmt_channel].conf1.mem_rd_rst = 1;
+		RMT.conf_ch[rmt_channel].conf1.tx_start = 1;
 
 		xSemaphoreTake(ws2812_sem, portMAX_DELAY);
 		vSemaphoreDelete(ws2812_sem);
 		ws2812_sem = NULL;
 
 		free(ws2812_buffer);
+		esp_intr_free(rmt_intr_handle);
     }
 
 	void initRMTChannel(int rmtChannel)
@@ -196,13 +209,13 @@ protected:
 
 		portBASE_TYPE taskAwoken = 0;
 
-		if (RMT.int_st.ch0_tx_thr_event) {
+		if (RMT.int_st.val & BIT(24 + c->rmt_channel)) { // check if ch*_tx_thr_event is set
 			copyToRmtBlock_half(*c);
-			RMT.int_clr.ch0_tx_thr_event = 1;
+			RMT.int_clr.val |= BIT(24 + c->rmt_channel); // set ch*_tx_thr_event
 		}
-		else if (RMT.int_st.ch0_tx_end && c->ws2812_sem) {
+		else if ((RMT.int_st.val & BIT(c->rmt_channel * 3)) && c->ws2812_sem) { // check if ch*_tx_end is set
 			xSemaphoreGiveFromISR(c->ws2812_sem, &taskAwoken);
-			RMT.int_clr.ch0_tx_end = 1;
+			RMT.int_clr.val |= BIT(c->rmt_channel * 3); // set ch*_tx_end
 		}
 	}
 
@@ -225,7 +238,7 @@ protected:
 			}
 			// Clear the channel's data block and return
 			for (i = 0; i < MAX_PULSES; i++) {
-				RMTMEM.chan[RMTCHANNEL].data32[i + offset].val = 0;
+				RMTMEM.chan[c.rmt_channel].data32[i + offset].val = 0;
 			}
 			c.ws2812_bufIsDirty = 0;
 			return;
@@ -239,19 +252,19 @@ protected:
 			for (j = 0; j < 8; j++, byteval <<= 1) {
 				int bitval = (byteval >> 7) & 0x01;
 				int data32_idx = i * 8 + offset + j;
-				RMTMEM.chan[RMTCHANNEL].data32[data32_idx].val = c.ws2812_bitval_to_rmt_map[bitval].val;
+				RMTMEM.chan[c.rmt_channel].data32[data32_idx].val = c.ws2812_bitval_to_rmt_map[bitval].val;
 			}
 
 			// Handle the reset bit by stretching duration1 for the final bit in the stream
 			if (i + c.ws2812_pos == c.ws2812_len - 1) {
-				RMTMEM.chan[RMTCHANNEL].data32[i * 8 + offset + 7].duration1 =
+				RMTMEM.chan[c.rmt_channel].data32[i * 8 + offset + 7].duration1 =
 					c.TRS / (RMT_DURATION_NS * DIVIDER);
 			}
 		}
 
 		// Clear the remainder of the channel's data not set above
 		for (i *= 8; i < MAX_PULSES; i++) {
-			RMTMEM.chan[RMTCHANNEL].data32[i + offset].val = 0;
+			RMTMEM.chan[c.rmt_channel].data32[i + offset].val = 0;
 		}
 
 		c.ws2812_pos += len;
