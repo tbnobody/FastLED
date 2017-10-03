@@ -79,12 +79,6 @@ typedef union {
     uint32_t val;
 } rmtPulsePair;
 
-static uint8_t *ws2812_buffer = NULL;
-static uint16_t ws2812_pos, ws2812_len, ws2812_half, ws2812_bufIsDirty;
-static xSemaphoreHandle ws2812_sem = NULL;
-static rmtPulsePair ws2812_bitval_to_rmt_map[2];
-static uint16_t TRS;
-
 template <int DATA_PIN, int T1, int T2, int T3, EOrder RGB_ORDER = RGB, int XTRA0 = 0, bool FLIP = false, int WAIT_TIME = 5>
 class ClocklessController : public CPixelLEDController<RGB_ORDER> {
 
@@ -92,6 +86,13 @@ class ClocklessController : public CPixelLEDController<RGB_ORDER> {
 	uint16_t T0H, T1H, T0L, T1L;
 
 public:
+
+	uint8_t *ws2812_buffer = NULL;
+	uint16_t ws2812_pos, ws2812_len, ws2812_half, ws2812_bufIsDirty;
+	xSemaphoreHandle ws2812_sem = NULL;
+	rmtPulsePair ws2812_bitval_to_rmt_map[2];
+	uint16_t TRS;
+
     virtual void init() {
 		ESP_LOGI("fastled", "T1: %d T2: %d T3: %d", T1, T2, T3);
 		ESP_LOGI("fastled", "T1: %ld T2: %ld T3: %ld", CLKS_TO_NS(T1), CLKS_TO_NS(T2), CLKS_TO_NS(T3));
@@ -129,7 +130,7 @@ public:
 		ws2812_bitval_to_rmt_map[1].duration0 = T1H / (RMT_DURATION_NS * DIVIDER);
 		ws2812_bitval_to_rmt_map[1].duration1 = T1L / (RMT_DURATION_NS * DIVIDER);
 
-		esp_intr_alloc(ETS_RMT_INTR_SOURCE, 0, ws2812_handleInterrupt, NULL, &rmt_intr_handle);
+		esp_intr_alloc(ETS_RMT_INTR_SOURCE, 0, ws2812_handleInterrupt, this, &rmt_intr_handle);
     }
 
     virtual uint16_t getMaxRefreshRate() const { return 400; }
@@ -152,11 +153,11 @@ protected:
 		ws2812_pos = 0;
 		ws2812_half = 0;
 
-		copyToRmtBlock_half();
+		copyToRmtBlock_half(*this);
 
 		if (ws2812_pos < ws2812_len) {
 			// Fill the other half of the buffer block
-			copyToRmtBlock_half();
+			copyToRmtBlock_half(*this);
 		}
 
 		ws2812_sem = xSemaphoreCreateBinary();
@@ -191,58 +192,60 @@ protected:
 
 	static void ws2812_handleInterrupt(void *arg)
 	{
+		ClocklessController* c = static_cast<ClocklessController*>(arg);
+
 		portBASE_TYPE taskAwoken = 0;
 
 		if (RMT.int_st.ch0_tx_thr_event) {
-			copyToRmtBlock_half();
+			copyToRmtBlock_half(*c);
 			RMT.int_clr.ch0_tx_thr_event = 1;
 		}
-		else if (RMT.int_st.ch0_tx_end && ws2812_sem) {
-			xSemaphoreGiveFromISR(ws2812_sem, &taskAwoken);
+		else if (RMT.int_st.ch0_tx_end && c->ws2812_sem) {
+			xSemaphoreGiveFromISR(c->ws2812_sem, &taskAwoken);
 			RMT.int_clr.ch0_tx_end = 1;
 		}
 	}
 
-	static void copyToRmtBlock_half()
+	static void copyToRmtBlock_half(ClocklessController& c)
 	{
 		// This fills half an RMT block
 		// When wraparound is happening, we want to keep the inactive half of the RMT block filled
 		uint16_t i, j, offset, len, byteval;
 
-		offset = ws2812_half * MAX_PULSES;
-		ws2812_half = !ws2812_half;
+		offset = c.ws2812_half * MAX_PULSES;
+		c.ws2812_half = !c.ws2812_half;
 
-		len = ws2812_len - ws2812_pos;
+		len = c.ws2812_len - c.ws2812_pos;
 		if (len > (MAX_PULSES / 8))
 			len = (MAX_PULSES / 8);
 
 		if (!len) {
-			if (!ws2812_bufIsDirty) {
+			if (!c.ws2812_bufIsDirty) {
 				return;
 			}
 			// Clear the channel's data block and return
 			for (i = 0; i < MAX_PULSES; i++) {
 				RMTMEM.chan[RMTCHANNEL].data32[i + offset].val = 0;
 			}
-			ws2812_bufIsDirty = 0;
+			c.ws2812_bufIsDirty = 0;
 			return;
 		}
-		ws2812_bufIsDirty = 1;
+		c.ws2812_bufIsDirty = 1;
 
 		for (i = 0; i < len; i++) {
-			byteval = ws2812_buffer[i + ws2812_pos];
+			byteval = c.ws2812_buffer[i + c.ws2812_pos];
 
 			// Shift bits out, MSB first, setting RMTMEM.chan[n].data32[x] to the rmtPulsePair value corresponding to the buffered bit value
 			for (j = 0; j < 8; j++, byteval <<= 1) {
 				int bitval = (byteval >> 7) & 0x01;
 				int data32_idx = i * 8 + offset + j;
-				RMTMEM.chan[RMTCHANNEL].data32[data32_idx].val = ws2812_bitval_to_rmt_map[bitval].val;
+				RMTMEM.chan[RMTCHANNEL].data32[data32_idx].val = c.ws2812_bitval_to_rmt_map[bitval].val;
 			}
 
 			// Handle the reset bit by stretching duration1 for the final bit in the stream
-			if (i + ws2812_pos == ws2812_len - 1) {
+			if (i + c.ws2812_pos == c.ws2812_len - 1) {
 				RMTMEM.chan[RMTCHANNEL].data32[i * 8 + offset + 7].duration1 =
-					TRS / (RMT_DURATION_NS * DIVIDER);
+					c.TRS / (RMT_DURATION_NS * DIVIDER);
 			}
 		}
 
@@ -251,7 +254,7 @@ protected:
 			RMTMEM.chan[RMTCHANNEL].data32[i + offset].val = 0;
 		}
 
-		ws2812_pos += len;
+		c.ws2812_pos += len;
 	}
 };
 
