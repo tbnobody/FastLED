@@ -69,16 +69,6 @@ extern "C" {
 
 #define FASTLED_HAS_CLOCKLESS 1
 
-typedef union {
-    struct {
-        uint32_t duration0:15;
-        uint32_t level0:1;
-        uint32_t duration1:15;
-        uint32_t level1:1;
-    };
-    uint32_t val;
-} rmtPulsePair;
-
 static uint8_t rmt_channels_used = 0;
 
 template <int DATA_PIN, int T1, int T2, int T3, EOrder RGB_ORDER = RGB, int XTRA0 = 0, bool FLIP = false, int WAIT_TIME = 5>
@@ -92,7 +82,7 @@ public:
 	uint8_t *ws2812_buffer = NULL;
 	uint16_t ws2812_pos, ws2812_len, ws2812_half, ws2812_bufIsDirty;
 	xSemaphoreHandle ws2812_sem = NULL;
-	rmtPulsePair ws2812_bitval_to_rmt_map[2];
+	rmt_item32_t ws2812_bitval_to_rmt_map[2];
 	uint16_t TRS;
 	uint8_t rmt_channel;
 
@@ -248,7 +238,7 @@ protected:
 		for (i = 0; i < len; i++) {
 			byteval = c.ws2812_buffer[i + c.ws2812_pos];
 
-			// Shift bits out, MSB first, setting RMTMEM.chan[n].data32[x] to the rmtPulsePair value corresponding to the buffered bit value
+			// Shift bits out, MSB first, setting RMTMEM.chan[n].data32[x] to the rmt_item32_t value corresponding to the buffered bit value
 			for (j = 0; j < 8; j++, byteval <<= 1) {
 				int bitval = (byteval >> 7) & 0x01;
 				int data32_idx = i * 8 + offset + j;
