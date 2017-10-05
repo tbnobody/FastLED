@@ -60,7 +60,6 @@ extern "C" {
 }
 #endif
 
-#define RMTCHANNEL          0 /* There are 8 possible channels */
 #define DIVIDER             4 /* 8 still seems to work, but timings become marginal */
 #define MAX_PULSES         32 /* A channel has a 64 "pulse" buffer - we use half per pass */
 #define RMT_DURATION_NS  12.5 /* minimum time of a single RMT duration based on clock ns */
@@ -79,12 +78,12 @@ class ClocklessController : public CPixelLEDController<RGB_ORDER> {
 
 public:
 
-	uint8_t *ws2812_buffer = NULL;
 	uint16_t ws2812_pos, ws2812_len, ws2812_half, ws2812_bufIsDirty;
 	xSemaphoreHandle ws2812_sem = NULL;
 	rmt_item32_t ws2812_bitval_to_rmt_map[2];
 	uint16_t TRS;
 	uint8_t rmt_channel;
+	PixelController<RGB_ORDER> *local_pixels;
 
     virtual void init() {
 		ESP_LOGI("fastled", "T1: %d T2: %d T3: %d", T1, T2, T3);
@@ -141,19 +140,10 @@ protected:
 		esp_intr_alloc(ETS_RMT_INTR_SOURCE, 0, ws2812_handleInterrupt, this, &rmt_intr_handle);
 
 		ws2812_len = (pixels.size() * 3) * sizeof(uint8_t);
-		ws2812_buffer = (uint8_t *) malloc(ws2812_len);
-
-		for (uint16_t i = 0; i < pixels.size(); i++) {
-			// Where color order is translated from RGB (e.g., WS2812 = GRB)
-			ws2812_buffer[0 + i * 3] = pixels.loadAndScale0();
-			ws2812_buffer[1 + i * 3] = pixels.loadAndScale1();
-			ws2812_buffer[2 + i * 3] = pixels.loadAndScale2();
-			pixels.advanceData();
-			pixels.stepDithering();
-		}
-
 		ws2812_pos = 0;
 		ws2812_half = 0;
+
+		local_pixels = &pixels;
 
 		copyToRmtBlock_half(*this);
 
@@ -171,7 +161,6 @@ protected:
 		vSemaphoreDelete(ws2812_sem);
 		ws2812_sem = NULL;
 
-		free(ws2812_buffer);
 		esp_intr_free(rmt_intr_handle);
     }
 
@@ -214,6 +203,7 @@ protected:
 		// This fills half an RMT block
 		// When wraparound is happening, we want to keep the inactive half of the RMT block filled
 		uint16_t i, j, offset, len, byteval;
+		static uint8_t rgb_channel = 0;
 
 		offset = c.ws2812_half * MAX_PULSES;
 		c.ws2812_half = !c.ws2812_half;
@@ -236,7 +226,22 @@ protected:
 		c.ws2812_bufIsDirty = 1;
 
 		for (i = 0; i < len; i++) {
-			byteval = c.ws2812_buffer[i + c.ws2812_pos];
+			switch (rgb_channel) {
+			case 1:
+				byteval = c.local_pixels->loadAndScale1();
+				rgb_channel = 2;
+				break;
+			case 2:
+				byteval = c.local_pixels->loadAndScale2();
+				c.local_pixels->advanceData();
+				c.local_pixels->stepDithering();
+				rgb_channel = 0;
+				break;
+			default:
+				byteval = c.local_pixels->loadAndScale0();
+				rgb_channel = 1;
+				break;
+			}
 
 			// Shift bits out, MSB first, setting RMTMEM.chan[n].data32[x] to the rmt_item32_t value corresponding to the buffered bit value
 			for (j = 0; j < 8; j++, byteval <<= 1) {
