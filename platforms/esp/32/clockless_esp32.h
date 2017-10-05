@@ -35,25 +35,14 @@ FASTLED_NAMESPACE_BEGIN
 extern "C" {
 #endif
 
-#if defined(ARDUINO)
-	#include "esp32-hal.h"
-	#include "esp_intr.h"
-	#include "driver/gpio.h"
-	#include "driver/rmt.h"
-	#include "driver/periph_ctrl.h"
-	#include "freertos/semphr.h"
-	#include "soc/rmt_struct.h"
-#elif defined(ESP_PLATFORM)
-	#include <esp_intr.h>
-	#include <driver/gpio.h>
-	#include <driver/rmt.h>
-	#include <freertos/FreeRTOS.h>
-	#include <freertos/semphr.h>
-	#include <soc/dport_reg.h>
-	#include <soc/gpio_sig_map.h>
-	#include <soc/rmt_struct.h>
-	#include <stdio.h>
-#endif
+#include "esp32-hal.h"
+#include "esp_intr.h"
+#include "driver/gpio.h"
+#include "driver/rmt.h"
+#include "driver/periph_ctrl.h"
+#include "freertos/semphr.h"
+#include "soc/rmt_struct.h"
+
 #include "esp_log.h"
 
 #ifdef __cplusplus
@@ -71,31 +60,28 @@ extern "C" {
 static uint8_t rmt_channels_used = 0;
 
 template <int DATA_PIN, int T1, int T2, int T3, EOrder RGB_ORDER = RGB, int XTRA0 = 0, bool FLIP = false, int WAIT_TIME = 5>
-class ClocklessController : public CPixelLEDController<RGB_ORDER> {
-
+class ClocklessController : public CPixelLEDController<RGB_ORDER>
+{
 	intr_handle_t rmt_intr_handle = NULL;
 	uint16_t T0H, T1H, T0L, T1L;
 
 public:
 
-	uint16_t ws2812_pos, ws2812_len, ws2812_half, ws2812_bufIsDirty;
-	xSemaphoreHandle ws2812_sem = NULL;
-	rmt_item32_t ws2812_bitval_to_rmt_map[2];
+	uint16_t buf_pos, buf_len, buf_half, buf_isDirty;
+	xSemaphoreHandle sem = NULL;
+	rmt_item32_t bitval_to_rmt_map[2];
 	uint16_t TRS;
 	uint8_t rmt_channel;
 	PixelController<RGB_ORDER> *local_pixels;
 
-    virtual void init() {
-		ESP_LOGI("fastled", "T1: %d T2: %d T3: %d", T1, T2, T3);
-		ESP_LOGI("fastled", "T1: %ld T2: %ld T3: %ld", CLKS_TO_NS(T1), CLKS_TO_NS(T2), CLKS_TO_NS(T3));
-
-
+	virtual void init()
+	{
 		TRS = 50000;
-		T0H = CLKS_TO_NS(T1); // 350;
-		T1H = CLKS_TO_NS(T1 + T2); //700;
+		T0H = CLKS_TO_NS(T1);
+		T1H = CLKS_TO_NS(T1 + T2);
 
-		T0L = CLKS_TO_NS(T2 + T3); //800;
-		T1L = CLKS_TO_NS(T3); //600;
+		T0L = CLKS_TO_NS(T2 + T3);
+		T1L = CLKS_TO_NS(T3);
 
 		DPORT_SET_PERI_REG_MASK(DPORT_PERIP_CLK_EN_REG, DPORT_RMT_CLK_EN);
 		DPORT_CLEAR_PERI_REG_MASK(DPORT_PERIP_RST_EN_REG, DPORT_RMT_RST);
@@ -118,48 +104,48 @@ public:
 		RMT.int_ena.val |= BIT(24 + rmt_channel); // set ch*_tx_thr_event
 		RMT.int_ena.val |= BIT(rmt_channel * 3); // set ch*_tx_end
 
-		// RMT config for WS2812 bit val 0
-		ws2812_bitval_to_rmt_map[0].level0 = 1;
-		ws2812_bitval_to_rmt_map[0].level1 = 0;
-		ws2812_bitval_to_rmt_map[0].duration0 = T0H / (RMT_DURATION_NS * DIVIDER);
-		ws2812_bitval_to_rmt_map[0].duration1 = T0L / (RMT_DURATION_NS * DIVIDER);
+		// RMT config for bit val 0
+		bitval_to_rmt_map[0].level0 = 1;
+		bitval_to_rmt_map[0].level1 = 0;
+		bitval_to_rmt_map[0].duration0 = T0H / (RMT_DURATION_NS * DIVIDER);
+		bitval_to_rmt_map[0].duration1 = T0L / (RMT_DURATION_NS * DIVIDER);
 
-		// RMT config for WS2812 bit val 1
-		ws2812_bitval_to_rmt_map[1].level0 = 1;
-		ws2812_bitval_to_rmt_map[1].level1 = 0;
-		ws2812_bitval_to_rmt_map[1].duration0 = T1H / (RMT_DURATION_NS * DIVIDER);
-		ws2812_bitval_to_rmt_map[1].duration1 = T1L / (RMT_DURATION_NS * DIVIDER);
+		// RMT config for bit val 1
+		bitval_to_rmt_map[1].level0 = 1;
+		bitval_to_rmt_map[1].level1 = 0;
+		bitval_to_rmt_map[1].duration0 = T1H / (RMT_DURATION_NS * DIVIDER);
+		bitval_to_rmt_map[1].duration1 = T1L / (RMT_DURATION_NS * DIVIDER);
     }
 
     virtual uint16_t getMaxRefreshRate() const { return 400; }
 
 protected:
 
-    virtual void showPixels(PixelController<RGB_ORDER> & pixels) {
+	virtual void showPixels(PixelController<RGB_ORDER> & pixels)
+	{
+		esp_intr_alloc(ETS_RMT_INTR_SOURCE, 0, handleInterrupt, this, &rmt_intr_handle);
 
-		esp_intr_alloc(ETS_RMT_INTR_SOURCE, 0, ws2812_handleInterrupt, this, &rmt_intr_handle);
-
-		ws2812_len = (pixels.size() * 3) * sizeof(uint8_t);
-		ws2812_pos = 0;
-		ws2812_half = 0;
+		buf_len = (pixels.size() * 3) * sizeof(uint8_t);
+		buf_pos = 0;
+		buf_half = 0;
 
 		local_pixels = &pixels;
 
 		copyToRmtBlock_half(*this);
 
-		if (ws2812_pos < ws2812_len) {
+		if (buf_pos < buf_len) {
 			// Fill the other half of the buffer block
 			copyToRmtBlock_half(*this);
 		}
 
-		ws2812_sem = xSemaphoreCreateBinary();
+		sem = xSemaphoreCreateBinary();
 
 		RMT.conf_ch[rmt_channel].conf1.mem_rd_rst = 1;
 		RMT.conf_ch[rmt_channel].conf1.tx_start = 1;
 
-		xSemaphoreTake(ws2812_sem, portMAX_DELAY);
-		vSemaphoreDelete(ws2812_sem);
-		ws2812_sem = NULL;
+		xSemaphoreTake(sem, portMAX_DELAY);
+		vSemaphoreDelete(sem);
+		sem = NULL;
 
 		esp_intr_free(rmt_intr_handle);
     }
@@ -182,19 +168,23 @@ protected:
 		RMT.conf_ch[rmtChannel].conf1.idle_out_lv = 0;
 	}
 
-	static void ws2812_handleInterrupt(void *arg)
+	static void handleInterrupt(void *arg)
 	{
 		ClocklessController* c = static_cast<ClocklessController*>(arg);
 
-		portBASE_TYPE taskAwoken = 0;
+		portBASE_TYPE xHigherPriorityTaskWoken  = 0;
 
 		if (RMT.int_st.val & BIT(24 + c->rmt_channel)) { // check if ch*_tx_thr_event is set
 			copyToRmtBlock_half(*c);
 			RMT.int_clr.val |= BIT(24 + c->rmt_channel); // set ch*_tx_thr_event
 		}
-		else if ((RMT.int_st.val & BIT(c->rmt_channel * 3)) && c->ws2812_sem) { // check if ch*_tx_end is set
-			xSemaphoreGiveFromISR(c->ws2812_sem, &taskAwoken);
+		else if ((RMT.int_st.val & BIT(c->rmt_channel * 3)) && c->sem) { // check if ch*_tx_end is set
+			xSemaphoreGiveFromISR(c->sem, &xHigherPriorityTaskWoken);
 			RMT.int_clr.val |= BIT(c->rmt_channel * 3); // set ch*_tx_end
+
+			if (xHigherPriorityTaskWoken == pdTRUE) {
+				portYIELD_FROM_ISR();
+			}
 		}
 	}
 
@@ -205,25 +195,26 @@ protected:
 		uint16_t i, j, offset, len, byteval;
 		static uint8_t rgb_channel = 0;
 
-		offset = c.ws2812_half * MAX_PULSES;
-		c.ws2812_half = !c.ws2812_half;
+		offset = c.buf_half * MAX_PULSES;
+		c.buf_half = !c.buf_half;
 
-		len = c.ws2812_len - c.ws2812_pos;
+		len = c.buf_len - c.buf_pos;
 		if (len > (MAX_PULSES / 8))
 			len = (MAX_PULSES / 8);
 
 		if (!len) {
-			if (!c.ws2812_bufIsDirty) {
+			if (!c.buf_isDirty) {
 				return;
 			}
 			// Clear the channel's data block and return
 			for (i = 0; i < MAX_PULSES; i++) {
 				RMTMEM.chan[c.rmt_channel].data32[i + offset].val = 0;
 			}
-			c.ws2812_bufIsDirty = 0;
+
+			c.buf_isDirty = 0;
 			return;
 		}
-		c.ws2812_bufIsDirty = 1;
+		c.buf_isDirty = 1;
 
 		for (i = 0; i < len; i++) {
 			switch (rgb_channel) {
@@ -247,11 +238,11 @@ protected:
 			for (j = 0; j < 8; j++, byteval <<= 1) {
 				int bitval = (byteval >> 7) & 0x01;
 				int data32_idx = i * 8 + offset + j;
-				RMTMEM.chan[c.rmt_channel].data32[data32_idx].val = c.ws2812_bitval_to_rmt_map[bitval].val;
+				RMTMEM.chan[c.rmt_channel].data32[data32_idx].val = c.bitval_to_rmt_map[bitval].val;
 			}
 
 			// Handle the reset bit by stretching duration1 for the final bit in the stream
-			if (i + c.ws2812_pos == c.ws2812_len - 1) {
+			if (i + c.buf_pos == c.buf_len - 1) {
 				RMTMEM.chan[c.rmt_channel].data32[i * 8 + offset + 7].duration1 =
 					c.TRS / (RMT_DURATION_NS * DIVIDER);
 			}
@@ -262,7 +253,7 @@ protected:
 			RMTMEM.chan[c.rmt_channel].data32[i + offset].val = 0;
 		}
 
-		c.ws2812_pos += len;
+		c.buf_pos += len;
 	}
 };
 
